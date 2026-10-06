@@ -61,6 +61,19 @@ function canUseCredential(
   );
 }
 
+const claudeRefreshQueues = new Map<string, Promise<unknown>>();
+/** Run `fn` after earlier refreshes of the same secret finish. */
+function withClaudeRefreshMutex<T>(secretId: string, fn: () => Promise<T>): Promise<T> {
+  const previous = claudeRefreshQueues.get(secretId) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(fn);
+  const tail = next.catch(() => undefined);
+  claudeRefreshQueues.set(secretId, tail);
+  void tail.then(() => {
+    if (claudeRefreshQueues.get(secretId) === tail) claudeRefreshQueues.delete(secretId);
+  });
+  return next;
+}
+
 export function aiConnectionService(db: Db) {
   const secrets = secretService(db);
   async function membership(companyId: string, userId: string | null) {
@@ -573,7 +586,8 @@ export function aiConnectionService(db: Db) {
    * returns only the access token. Other credentials are returned unchanged.
    */
   async function credential(row: Pick<Awaited<ReturnType<typeof select>>, "connection" | "grant">, retry = 0, audit?: CredentialAudit): Promise<string> {
-    const raw = await credentialRaw(row, retry, audit);
+    const retriesLeft = Math.max(0, 1 - retry);
+    const raw = await credentialRaw(row, 0, audit);
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config?.ai);
     if (!metadata.success || metadata.data.provider !== "anthropic" || metadata.data.method !== "subscription") return raw;
     const ref = row.grant.credentialSecretRefs.find((r) => r.configPath === "ai.credential");
@@ -582,39 +596,38 @@ export function aiConnectionService(db: Db) {
     let version: number | undefined;
     try {
       return await resolveClaudeAccessToken(raw, {
-        // An advisory lock serializes refreshes of one secret. Rotation and
-        // reconnect never take it, and this code holds no row lock while it
-        // calls rotate(), so the lock order of rotate() is not changed.
-        withLock: (fn) => db.transaction(async (tx) => {
-          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${ref.secretId}, 0))`);
-          return fn({
-            readRaw: async () => {
-              const [secret] = await db
-                .select({ latestVersion: companySecrets.latestVersion })
-                .from(companySecrets)
-                .where(and(eq(companySecrets.id, ref.secretId), eq(companySecrets.companyId, row.connection.companyId)));
-              version = secret?.latestVersion;
-              attempted = await credentialRaw(row, 0, audit);
-              return attempted;
-            },
-            // A refresh is not a new login: keep the session epoch. A stale
-            // version means a reconnect won the race; its credential stays.
-            writeRaw: async (value) => {
-              try {
-                await secretService(db).rotate(
-                  ref.secretId,
-                  { value, preserveAiSessionEpoch: true, ...(version !== undefined ? { expectedLatestVersion: version } : {}) },
-                  { userId: row.grant.subjectUserId },
-                );
-              } catch (error) {
-                if ((error as { status?: number })?.status !== 409) throw error;
-              }
-            },
-          });
-        }),
+        // Refreshes of one secret run one at a time in this process. No database
+        // transaction or row lock is held while the provider request runs, so the
+        // lock order of rotate() is unchanged and no extra connection is held. The
+        // write uses expectedLatestVersion, so a reconnect always wins the race.
+        withLock: (fn) => withClaudeRefreshMutex(ref.secretId, () => fn({
+          readRaw: async () => {
+            const [secret] = await db
+              .select({ latestVersion: companySecrets.latestVersion })
+              .from(companySecrets)
+              .where(and(eq(companySecrets.id, ref.secretId), eq(companySecrets.companyId, row.connection.companyId)));
+            version = secret?.latestVersion;
+            attempted = await credentialRaw(row, 0, audit);
+            return attempted;
+          },
+          // A refresh is not a new login: keep the session epoch.
+          writeRaw: (value) => secretService(db).rotate(
+            ref.secretId,
+            { value, preserveAiSessionEpoch: true, ...(version !== undefined ? { expectedLatestVersion: version } : {}) },
+            { userId: row.grant.subjectUserId },
+          ),
+        })),
       });
     } catch (error) {
+      // A reconnect replaced the secret while the provider request ran. Use the new credential.
+      if ((error as { status?: number })?.status === 409 && retriesLeft > 0) return credential(row, retry + 1, audit);
       if (error instanceof ClaudeOauthRefreshError) {
+        if (error.rejected && retriesLeft > 0) {
+          // Another server process may have rotated the refresh token first. Start over with its value.
+          const current = parseClaudeOauthCredential(await credentialRaw(row))?.claudeAiOauth.refreshToken;
+          const refused = parseClaudeOauthCredential(attempted)?.claudeAiOauth.refreshToken;
+          if (current && refused && current !== refused) return credential(row, retry + 1, audit);
+        }
         if (error.rejected) await markRefreshRefused(row, ref.secretId, attempted);
         throw unprocessable(
           error.rejected ? "Reconnect this AI account" : "The Claude subscription token could not be refreshed. Try again.",

@@ -296,9 +296,8 @@ export async function prepareManagedAiRuntime(
       return (await db.select({ epoch: companySecrets.aiSessionEpoch, version: companySecrets.latestVersion })
         .from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, credentialRef.secretId))).limit(1))[0];
     };
-    // A Claude token refresh writes a new secret version, so the version
-    // baseline must come after the single credential() call. The check below
-    // still guards the rest of the preparation.
+    // A Claude token refresh writes a new version but keeps the session epoch.
+    // A reconnect changes the epoch, so the epoch alone detects it.
     const refreshesToken = !noAuth && input.binding.provider === "anthropic" && selection.attribution.method === "subscription";
     const { value, freshness } = await (async () => {
       if (noAuth) return { value: "", freshness: undefined };
@@ -306,11 +305,10 @@ export async function prepareManagedAiRuntime(
       // the first read. Re-read the saved credential, retaining the epoch guard
       // against a concurrent reconnect or explicit rotation.
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const baseline = refreshesToken ? undefined : await readFreshness();
+        const before = await readFreshness();
         const value = await service.runtimeCredential(selection);
-        const before = baseline ?? await readFreshness();
         const after = await readFreshness();
-        if (before && after && before.version === after.version && before.epoch === after.epoch) {
+        if (before && after && before.epoch === after.epoch && (refreshesToken || before.version === after.version)) {
           return { value, freshness: after };
         }
         if (!before || before.epoch !== after?.epoch) break;
