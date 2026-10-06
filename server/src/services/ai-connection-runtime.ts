@@ -1,7 +1,6 @@
 import { environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
 import type { PluginTaskCredentialWritebackBinding } from "./plugin-task-credential-writeback.js";
 import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
-import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import os from "node:os";
@@ -296,6 +295,11 @@ export async function prepareManagedAiRuntime(
       return (await db.select({ epoch: companySecrets.aiSessionEpoch, version: companySecrets.latestVersion })
         .from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, credentialRef.secretId))).limit(1))[0];
     };
+    // A Claude token refresh writes a new secret version. Do it before the
+    // freshness baseline, so the check below only sees changes made by others.
+    if (!noAuth && input.binding.provider === "anthropic" && selection.attribution.method === "subscription") {
+      await service.credential(selection);
+    }
     const { value, freshness } = await (async () => {
       if (noAuth) return { value: "", freshness: undefined };
       // Recovering a rotated quota token can advance the secret version during
@@ -388,10 +392,7 @@ export async function prepareManagedAiRuntime(
       attribution.subscriptionId = await subscriptionService(db).register(subscription);
       void refreshSubscriptionConnection(db, subscription, attribution.subscriptionId);
     }
-    const generation = createHash("sha256")
-      .update(value)
-      .digest("hex")
-      .slice(0, 16);
+    const generation = service.credentialGeneration(selection, value);
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
     const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${noAuth ? "no-auth" : `${credentialRef!.secretId}:${freshness!.epoch}`}`;
     return {
